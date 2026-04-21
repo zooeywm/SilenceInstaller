@@ -6,6 +6,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMap>
 #include <QPointer>
 #include <QRandomGenerator>
 #include <QRegularExpression>
@@ -37,6 +38,14 @@ struct SseConnection
     QDateTime connectedAt;
 };
 
+struct PackageUpload
+{
+    QString fileName;
+    QByteArray bytes;
+    QString arguments;
+    QString targetDir;
+};
+
 QString sanitizeFileName(QString fileName)
 {
     fileName = QFileInfo(fileName).fileName().trimmed();
@@ -66,6 +75,18 @@ QString multipartParameter(const QByteArray &headerValue, const QString &name)
         QStringLiteral("%1=\"([^\"]*)\"").arg(QRegularExpression::escape(name)));
     const QRegularExpressionMatch match = expression.match(QString::fromUtf8(headerValue));
     return match.hasMatch() ? match.captured(1) : QString();
+}
+
+int indexedField(const QString &fieldName, const QString &prefix)
+{
+    if (fieldName == prefix)
+        return 0;
+    if (!fieldName.startsWith(prefix + QStringLiteral("_")))
+        return -1;
+
+    bool ok = false;
+    const int index = fieldName.mid(prefix.size() + 1).toInt(&ok);
+    return ok && index >= 0 ? index : -1;
 }
 
 QByteArray statusLine(int statusCode)
@@ -251,66 +272,76 @@ private:
 
     void handleCreateJob(const HttpRequest &request, HttpConnection *connection)
     {
-        QString fileName;
-        QByteArray packageBytes;
-        QString installArguments;
-        QString targetDir;
+        QVector<PackageUpload> packages;
         QString parseError;
-        if (!parseCreateJobBody(request, &fileName, &packageBytes, &installArguments, &targetDir, &parseError)) {
+        if (!parseCreateJobBody(request, &packages, &parseError)) {
             connection->sendResponse(400, "application/json",
                                      jsonResponse({{QStringLiteral("error"), parseError}}));
             return;
         }
 
-        const QString type = packageTypeForFile(fileName);
-
-        if (fileName.isEmpty() || type.isEmpty() || packageBytes.isEmpty()) {
+        if (packages.isEmpty()) {
             connection->sendResponse(400, "application/json", jsonResponse({
-                {QStringLiteral("error"), QStringLiteral("missing or unsupported package")}
+                {QStringLiteral("error"), QStringLiteral("missing package")}
             }));
             return;
         }
 
-        const QString id = QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMddHHmmsszzz")) +
-                           QStringLiteral("-") +
-                           QString::number(QRandomGenerator::global()->bounded(100000, 999999));
-        const QString packageDir = QDir(m_packageRoot).filePath(id);
-        if (!QDir().mkpath(packageDir)) {
-            connection->sendResponse(500, "application/json",
-                                     jsonResponse({{QStringLiteral("error"), QStringLiteral("cannot create package directory")}}));
-            return;
+        for (const PackageUpload &package : std::as_const(packages)) {
+            if (package.fileName.isEmpty() || packageTypeForFile(package.fileName).isEmpty() || package.bytes.isEmpty()) {
+                connection->sendResponse(400, "application/json", jsonResponse({
+                    {QStringLiteral("error"), QStringLiteral("missing or unsupported package")}
+                }));
+                return;
+            }
         }
 
-        const QString packagePath = QDir(packageDir).filePath(fileName);
-        QFile packageFile(packagePath);
-        if (!packageFile.open(QIODevice::WriteOnly) || packageFile.write(packageBytes) != packageBytes.size()) {
-            connection->sendResponse(500, "application/json",
-                                     jsonResponse({{QStringLiteral("error"), QStringLiteral("cannot store package")}}));
-            return;
+        QJsonArray jobs;
+        for (const PackageUpload &package : std::as_const(packages)) {
+            const QString id = QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMddHHmmsszzz")) +
+                               QStringLiteral("-") +
+                               QString::number(QRandomGenerator::global()->bounded(100000, 999999));
+            const QString packageDir = QDir(m_packageRoot).filePath(id);
+            if (!QDir().mkpath(packageDir)) {
+                connection->sendResponse(500, "application/json",
+                                         jsonResponse({{QStringLiteral("error"), QStringLiteral("cannot create package directory")}}));
+                return;
+            }
+
+            const QString packagePath = QDir(packageDir).filePath(package.fileName);
+            QFile packageFile(packagePath);
+            if (!packageFile.open(QIODevice::WriteOnly) || packageFile.write(package.bytes) != package.bytes.size()) {
+                connection->sendResponse(500, "application/json",
+                                         jsonResponse({{QStringLiteral("error"), QStringLiteral("cannot store package")}}));
+                return;
+            }
+            packageFile.close();
+
+            const QString encodedFileName = QString::fromUtf8(QUrl::toPercentEncoding(package.fileName));
+            jobs.append(QJsonObject{
+                {QStringLiteral("id"), id},
+                {QStringLiteral("type"), packageTypeForFile(package.fileName)},
+                {QStringLiteral("packageName"), package.fileName},
+                {QStringLiteral("downloadUrl"), QStringLiteral("/packages/%1/%2").arg(id, encodedFileName)},
+                {QStringLiteral("arguments"), package.arguments},
+                {QStringLiteral("targetDir"), package.targetDir},
+                {QStringLiteral("createdAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}
+            });
         }
-        packageFile.close();
 
-        const QString encodedFileName = QString::fromUtf8(QUrl::toPercentEncoding(fileName));
-        const QJsonObject job{
-            {QStringLiteral("id"), id},
-            {QStringLiteral("type"), type},
-            {QStringLiteral("packageName"), fileName},
-            {QStringLiteral("downloadUrl"), QStringLiteral("/packages/%1/%2").arg(id, encodedFileName)},
-            {QStringLiteral("arguments"), installArguments},
-            {QStringLiteral("targetDir"), targetDir},
-            {QStringLiteral("createdAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}
-        };
+        for (const QJsonValue &job : std::as_const(jobs))
+            broadcastEvent("install", QJsonDocument(job.toObject()).toJson(QJsonDocument::Compact), false);
 
-        broadcastEvent("install", QJsonDocument(job).toJson(QJsonDocument::Compact), false);
         connection->sendResponse(201, "application/json", jsonResponse({
             {QStringLiteral("ok"), true},
-            {QStringLiteral("job"), job},
+            {QStringLiteral("jobs"), jobs},
+            {QStringLiteral("jobCount"), jobs.size()},
             {QStringLiteral("clientCount"), statusJson().value(QStringLiteral("clients")).toInt()}
         }));
     }
 
-    bool parseCreateJobBody(const HttpRequest &request, QString *fileName, QByteArray *packageBytes,
-                            QString *installArguments, QString *targetDir, QString *errorMessage) const
+    bool parseCreateJobBody(const HttpRequest &request, QVector<PackageUpload> *packages,
+                            QString *errorMessage) const
     {
         const QByteArray contentType = request.headers.value("content-type").toLower();
         if (contentType.startsWith("application/json")) {
@@ -322,10 +353,26 @@ private:
             }
 
             const QJsonObject input = document.object();
-            *fileName = sanitizeFileName(input.value(QStringLiteral("fileName")).toString());
-            *packageBytes = QByteArray::fromBase64(input.value(QStringLiteral("fileDataBase64")).toString().toUtf8());
-            *installArguments = input.value(QStringLiteral("arguments")).toString();
-            *targetDir = input.value(QStringLiteral("targetDir")).toString();
+            const QJsonArray inputJobs = input.value(QStringLiteral("jobs")).toArray();
+            if (!inputJobs.isEmpty()) {
+                for (const QJsonValue &value : inputJobs) {
+                    const QJsonObject job = value.toObject();
+                    packages->append(PackageUpload{
+                        sanitizeFileName(job.value(QStringLiteral("fileName")).toString()),
+                        QByteArray::fromBase64(job.value(QStringLiteral("fileDataBase64")).toString().toUtf8()),
+                        job.value(QStringLiteral("arguments")).toString(),
+                        job.value(QStringLiteral("targetDir")).toString()
+                    });
+                }
+                return true;
+            }
+
+            packages->append(PackageUpload{
+                sanitizeFileName(input.value(QStringLiteral("fileName")).toString()),
+                QByteArray::fromBase64(input.value(QStringLiteral("fileDataBase64")).toString().toUtf8()),
+                input.value(QStringLiteral("arguments")).toString(),
+                input.value(QStringLiteral("targetDir")).toString()
+            });
             return true;
         }
 
@@ -347,6 +394,10 @@ private:
 
         const QByteArray delimiter = "--" + boundary.toUtf8();
         qsizetype position = 0;
+        QMap<int, PackageUpload> indexedPackages;
+        QString globalArguments;
+        QString globalTargetDir;
+        int nextUploadIndex = 0;
         while (true) {
             qsizetype partStart = request.body.indexOf(delimiter, position);
             if (partStart < 0)
@@ -385,15 +436,36 @@ private:
             const QByteArray partBody = request.body.mid(dataStart, nextDelimiter - dataStart);
 
             if (!uploadedName.isEmpty()) {
-                *fileName = uploadedName;
-                *packageBytes = partBody;
+                int index = indexedField(fieldName, QStringLiteral("packageFile"));
+                if (index < 0)
+                    index = nextUploadIndex;
+                nextUploadIndex = std::max(nextUploadIndex, index + 1);
+                indexedPackages[index].fileName = uploadedName;
+                indexedPackages[index].bytes = partBody;
             } else if (fieldName == QStringLiteral("arguments")) {
-                *installArguments = QString::fromUtf8(partBody).trimmed();
+                globalArguments = QString::fromUtf8(partBody).trimmed();
             } else if (fieldName == QStringLiteral("targetDir")) {
-                *targetDir = QString::fromUtf8(partBody).trimmed();
+                globalTargetDir = QString::fromUtf8(partBody).trimmed();
+            } else {
+                const int argumentsIndex = indexedField(fieldName, QStringLiteral("arguments"));
+                const int targetDirIndex = indexedField(fieldName, QStringLiteral("targetDir"));
+                if (argumentsIndex >= 0) {
+                    indexedPackages[argumentsIndex].arguments = QString::fromUtf8(partBody).trimmed();
+                } else if (targetDirIndex >= 0) {
+                    indexedPackages[targetDirIndex].targetDir = QString::fromUtf8(partBody).trimmed();
+                }
             }
 
             position = nextDelimiter + 2;
+        }
+
+        for (PackageUpload package : indexedPackages) {
+            if (package.arguments.isEmpty())
+                package.arguments = globalArguments;
+            if (package.targetDir.isEmpty())
+                package.targetDir = globalTargetDir;
+            if (!package.fileName.isEmpty())
+                packages->append(std::move(package));
         }
 
         return true;
@@ -517,6 +589,14 @@ private:
     button { margin-top: 16px; padding: 9px 14px; border: 0; border-radius: 4px; background: #1f6feb; color: white; font-weight: 600; cursor: pointer; }
     button:disabled { background: #9aa4b2; cursor: wait; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .task-list { display: grid; gap: 10px; margin-top: 14px; }
+    .task { border: 1px solid #d9dee7; border-radius: 6px; padding: 12px; background: #fbfcfe; }
+    .task-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 10px; }
+    .task-name { font-weight: 600; overflow-wrap: anywhere; }
+    .task-meta { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+    .badge { color: #4b5563; background: #eef2f7; border-radius: 999px; padding: 2px 8px; font-size: 12px; }
+    .remove-task { margin: 0; padding: 3px 8px; background: #e5e7eb; color: #1f2933; font-size: 12px; }
+    .unsupported { border-color: #f2b8b5; background: #fff7f7; }
     .muted { color: #5f6b7a; font-size: 13px; }
     pre { max-height: 280px; overflow: auto; background: #111827; color: #d1d5db; padding: 12px; border-radius: 4px; white-space: pre-wrap; }
     @media (max-width: 720px) { .row { grid-template-columns: 1fr; } main { margin: 20px auto; } }
@@ -528,18 +608,15 @@ private:
   <section>
     <div class="row">
       <div><strong>在线客户端</strong><div id="clients" class="muted">读取中</div></div>
-      <div><strong>识别类型</strong><div id="detected" class="muted">请选择安装包</div></div>
+      <div><strong>待下发任务</strong><div id="detected" class="muted">请选择安装包</div></div>
     </div>
   </section>
   <section>
     <form id="jobForm">
       <label for="packageFile">安装包</label>
-      <input id="packageFile" type="file" required>
-      <label for="arguments">安装参数</label>
-      <input id="arguments" placeholder='例如 MSI: /qn /norestart，EXE: /S 或 /quiet'>
-      <label for="targetDir">ZIP 解压目录</label>
-      <input id="targetDir" placeholder='仅 zip 使用，例如 C:\Program Files\AppName'>
-      <button id="submitBtn" type="submit">推送安装任务</button>
+      <input id="packageFile" type="file" multiple>
+      <div id="taskList" class="task-list"></div>
+      <button id="submitBtn" type="submit">批量推送安装任务</button>
     </form>
   </section>
   <section>
@@ -553,6 +630,8 @@ const detected = document.getElementById('detected');
 const log = document.getElementById('log');
 const clients = document.getElementById('clients');
 const submitBtn = document.getElementById('submitBtn');
+const taskList = document.getElementById('taskList');
+const selectedTasks = [];
 
 function appendLog(message, data) {
   const text = `[${new Date().toLocaleTimeString()}] ${message}` + (data ? `\n${JSON.stringify(data, null, 2)}` : '');
@@ -566,28 +645,139 @@ function detectType(name) {
   return 'unsupported';
 }
 
+function defaultArguments(fileName) {
+  const lower = fileName.toLowerCase();
+  if (lower.endsWith('.msi')) return '/qn /norestart';
+  if (lower.endsWith('.exe')) return '/S';
+  return '';
+}
+
+function addFiles(files) {
+  Array.from(files).forEach(file => {
+    selectedTasks.push({
+      file,
+      type: detectType(file.name),
+      arguments: defaultArguments(file.name),
+      targetDir: ''
+    });
+  });
+  fileInput.value = '';
+  renderTasks();
+}
+
+function renderTasks() {
+  taskList.textContent = '';
+  if (!selectedTasks.length) {
+    detected.textContent = '请选择安装包';
+    return;
+  }
+
+  const supported = selectedTasks.filter(task => task.type !== 'unsupported').length;
+  detected.textContent = `${selectedTasks.length} 个文件，${supported} 个可下发`;
+
+  selectedTasks.forEach((entry, index) => {
+    const file = entry.file;
+    const type = entry.type;
+    const task = document.createElement('div');
+    task.className = `task ${type === 'unsupported' ? 'unsupported' : ''}`;
+    task.dataset.index = String(index);
+    task.dataset.type = type;
+
+    const head = document.createElement('div');
+    head.className = 'task-head';
+    const name = document.createElement('div');
+    name.className = 'task-name';
+    name.textContent = file.name;
+    const badge = document.createElement('span');
+    badge.className = 'badge';
+    badge.textContent = type;
+    const remove = document.createElement('button');
+    remove.className = 'remove-task';
+    remove.type = 'button';
+    remove.textContent = '移除';
+    remove.addEventListener('click', () => {
+      selectedTasks.splice(index, 1);
+      renderTasks();
+    });
+    const meta = document.createElement('div');
+    meta.className = 'task-meta';
+    meta.append(badge, remove);
+    head.append(name, meta);
+    task.append(head);
+
+    if (type === 'zip') {
+      const label = document.createElement('label');
+      label.htmlFor = `targetDir_${index}`;
+      label.textContent = 'ZIP 解压目录';
+      const input = document.createElement('input');
+      input.id = `targetDir_${index}`;
+      input.value = entry.targetDir;
+      input.placeholder = '例如 C:\\Program Files\\AppName';
+      input.addEventListener('input', () => {
+        entry.targetDir = input.value;
+      });
+      task.append(label, input);
+    } else if (type === 'installer') {
+      const label = document.createElement('label');
+      label.htmlFor = `arguments_${index}`;
+      label.textContent = '安装参数';
+      const input = document.createElement('input');
+      input.id = `arguments_${index}`;
+      input.value = entry.arguments;
+      input.placeholder = file.name.toLowerCase().endsWith('.msi') ? '/qn /norestart' : '/S 或 /quiet';
+      input.addEventListener('input', () => {
+        entry.arguments = input.value;
+      });
+      task.append(label, input);
+    } else {
+      const info = document.createElement('div');
+      info.className = 'muted';
+      info.textContent = '不支持该文件类型';
+      task.append(info);
+    }
+
+    taskList.append(task);
+  });
+}
+
 fileInput.addEventListener('change', () => {
-  const file = fileInput.files[0];
-  detected.textContent = file ? `${detectType(file.name)} (${file.name})` : '请选择安装包';
+  addFiles(fileInput.files);
 });
+if (fileInput.files && fileInput.files.length) {
+  addFiles(fileInput.files);
+} else {
+  renderTasks();
+}
 
 document.getElementById('jobForm').addEventListener('submit', async event => {
   event.preventDefault();
-  const file = fileInput.files[0];
-  if (!file) return;
+  if (!selectedTasks.length) return;
   submitBtn.disabled = true;
   try {
     const payload = new FormData();
-    payload.append('packageFile', file);
-    payload.append('arguments', document.getElementById('arguments').value);
-    payload.append('targetDir', document.getElementById('targetDir').value);
+    let jobCount = 0;
+    selectedTasks.forEach((entry, index) => {
+      const file = entry.file;
+      const type = entry.type;
+      if (type === 'unsupported') return;
+      payload.append(`packageFile_${index}`, file);
+      if (type === 'zip') {
+        payload.append(`targetDir_${index}`, entry.targetDir);
+      } else {
+        payload.append(`arguments_${index}`, entry.arguments);
+      }
+      jobCount += 1;
+    });
+    if (!jobCount) throw new Error('没有可下发的安装包');
     const response = await fetch('/api/jobs', {
       method: 'POST',
       body: payload
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || response.statusText);
-    appendLog('已推送安装任务', result);
+    appendLog(`已推送 ${result.jobCount || jobCount} 个安装任务`, result);
+    selectedTasks.length = 0;
+    renderTasks();
   } catch (error) {
     appendLog('推送失败', {error: String(error)});
   } finally {
