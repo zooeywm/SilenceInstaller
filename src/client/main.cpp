@@ -68,6 +68,11 @@ QString defaultZipTarget(const QString &packageName)
     return QDir(base).filePath(QFileInfo(packageName).completeBaseName());
 }
 
+QString jobTempDir(const QString &jobId)
+{
+    return QDir(QDir::tempPath()).filePath(QStringLiteral("SilenceInstaller/%1").arg(jobId));
+}
+
 QStringList splitArgumentsOrDefault(const QString &arguments, const QStringList &defaults)
 {
     if (arguments.trimmed().isEmpty())
@@ -226,8 +231,7 @@ private:
             }
 
             const QByteArray data = reply->readAll();
-            const QString jobDir = QDir(QDir::tempPath()).filePath(
-                QStringLiteral("SilenceInstaller/%1").arg(job.value(QStringLiteral("id")).toString()));
+            const QString jobDir = jobTempDir(job.value(QStringLiteral("id")).toString());
             if (!QDir().mkpath(jobDir)) {
                 finishJob(job, QStringLiteral("failed"), QStringLiteral("cannot create temp directory"), -1);
                 return;
@@ -343,8 +347,27 @@ private:
     void finishJob(const QJsonObject &job, const QString &status, const QString &message, int exitCode)
     {
         sendReport(job, status, message, exitCode);
+        cleanupJobFiles(job);
         m_installing = false;
         QTimer::singleShot(0, this, [this] { runNextJob(); });
+    }
+
+    void cleanupJobFiles(const QJsonObject &job)
+    {
+        const QString jobId = job.value(QStringLiteral("id")).toString();
+        if (jobId.isEmpty())
+            return;
+
+        const QString dirPath = jobTempDir(jobId);
+        QDir dir(dirPath);
+        if (!dir.exists())
+            return;
+
+        if (dir.removeRecursively()) {
+            QTextStream(stdout) << "Cleaned job files: " << dirPath << Qt::endl;
+        } else {
+            QTextStream(stderr) << "Failed to clean job files: " << dirPath << Qt::endl;
+        }
     }
 
     void sendReport(const QJsonObject &job, const QString &status, const QString &message, int exitCode)
